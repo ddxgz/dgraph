@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -34,6 +35,8 @@ var (
 	dgraph     = flag.String("d", "127.0.0.1:8080", "Dgraph server address")
 	concurrent = flag.Int("c", 100, "Number of concurrent requests to make to Dgraph")
 	numRdf     = flag.Int("m", 1000, "Number of RDF N-Quads to send as part of a mutation.")
+	maxRetries = flag.Uint64("retry", math.MaxUint64,
+		"Max number of retries to Dgraph in case of error")
 	// TLS configuration
 	tlsEnabled       = flag.Bool("tls.on", false, "Use TLS connections.")
 	tlsInsecure      = flag.Bool("tls.insecure", false, "Skip certificate validation (insecure)")
@@ -211,7 +214,8 @@ You can get the latest version from https://docs.dgraph.io
 		}
 	}
 
-	batch := client.NewBatchMutation(context.Background(), dgraphClient, *numRdf, *concurrent)
+	batch := client.NewBatchMutation(context.Background(), dgraphClient, *numRdf, *concurrent,
+		*maxRetries)
 
 	ticker := time.NewTicker(2 * time.Second)
 	go printCounters(batch, ticker)

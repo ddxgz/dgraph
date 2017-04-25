@@ -164,7 +164,11 @@ type BatchMutation struct {
 	// Num of mutations sent
 	mutations uint64
 	// To get time elapsed.
-	start time.Time
+	start      time.Time
+	numRetries uint64
+	// While running requests, if number of times we get errors > maxRetries, we
+	// crash.
+	maxRetries uint64
 }
 
 func (batch *BatchMutation) request(req *Req) {
@@ -177,6 +181,13 @@ RETRY:
 		if strings.Contains(errString, "x509") || grpc.Code(err) == codes.Internal {
 			log.Fatal(errString)
 		}
+
+		numRetries := atomic.LoadUint64(&batch.numRetries)
+		if numRetries >= batch.maxRetries {
+			log.Fatal("Max retries to Dgraph exhausted.")
+		}
+
+		atomic.AddUint64(&batch.numRetries, 1)
 		fmt.Printf("Retrying req: %d. Error: %v\n", counter, errString)
 		time.Sleep(5 * time.Millisecond)
 		goto RETRY
@@ -232,14 +243,15 @@ LOOP:
 // size is the number of RDF's that are sent as part of one request to Dgraph.
 // pending is the number of concurrent requests to make to Dgraph server.
 func NewBatchMutation(ctx context.Context, client graphp.DgraphClient,
-	size int, pending int) *BatchMutation {
+	size int, pending int, maxRetries uint64) *BatchMutation {
 	bm := BatchMutation{
-		size:    size,
-		pending: pending,
-		nquads:  make(chan nquadOp, 2*size),
-		schema:  make(chan graphp.SchemaUpdate, 2*size),
-		start:   time.Now(),
-		dc:      client,
+		size:       size,
+		pending:    pending,
+		nquads:     make(chan nquadOp, 2*size),
+		schema:     make(chan graphp.SchemaUpdate, 2*size),
+		start:      time.Now(),
+		dc:         client,
+		maxRetries: maxRetries,
 	}
 
 	for i := 0; i < pending; i++ {
