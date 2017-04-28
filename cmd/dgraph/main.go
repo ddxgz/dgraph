@@ -427,6 +427,48 @@ func hasGQLOps(mu *gql.Mutation) bool {
 	return len(mu.Set) > 0 || len(mu.Del) > 0 || len(mu.Schema) > 0
 }
 
+func clusterHandler(w http.ResponseWriter, r *http.Request) {
+	if !worker.HealthCheck() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	// Cors header required ??
+	//addCorsHeaders(w)
+	if r.Method == "OPTIONS" {
+		return
+	}
+	if r.Method != "POST" {
+		x.SetStatus(w, x.ErrorInvalidMethod, "Invalid method")
+		return
+	}
+
+	ctx := context.Background()
+
+	req, err := ioutil.ReadAll(r.Body)
+	if err != nil || len(req) == 0 {
+		x.TraceError(ctx, x.Wrapf(err, "Error while reading cluster request"))
+		x.SetStatus(w, x.ErrorInvalidRequest, "Invalid request encountered.")
+		return
+	}
+
+	var mc worker.MembershipChanges
+	if err = json.Unmarshal(req, &mc); err != nil || !mc.Valid() {
+		x.TraceError(ctx, x.Wrapf(err, "Error while unmarshalling cluster request"))
+		x.SetStatus(w, x.ErrorInvalidRequest, "Invalid request encountered.")
+		return
+	}
+
+	if err = worker.ManageClusterOverNetwork(mc); err != nil {
+		x.TraceError(ctx, x.Wrapf(err, "Error while handling manage cluster"))
+		x.SetStatus(w, x.Error, err.Error())
+		return
+	}
+
+	x.SetStatus(w, x.Success, "SUCCESS")
+
+}
+
 func queryHandler(w http.ResponseWriter, r *http.Request) {
 	if !worker.HealthCheck() {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -582,140 +624,6 @@ func handlerInit(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	return true
-}
-
-func groupIdsFromRequest(r *http.Request) (gids []uint32, msg string) {
-	groupIds := r.URL.Query().Get("gids")
-	if len(groupIds) == 0 {
-		msg = "Invalid request. No group ids defined."
-		return
-	}
-	for _, groupId := range strings.Split(groupIds, ",") {
-		gid, err := strconv.ParseUint(groupId, 0, 32)
-		if err != nil {
-			msg = "Not valid group ids"
-			return
-		}
-		gids = append(gids, uint32(gid))
-	}
-	return
-}
-
-func nodeIdFromRequest(r *http.Request) (nid uint64, msg string) {
-	nodeId := r.URL.Query().Get("nodeId")
-	var err error
-	if len(nodeId) == 0 {
-		msg = "Invalid request. No node id defined."
-		return
-	}
-	nid, err = strconv.ParseUint(nodeId, 0, 64)
-	if err != nil {
-		msg = "Not valid node id"
-		return
-	}
-	return
-}
-
-func removeGroupsHandler(w http.ResponseWriter, r *http.Request) {
-	if !handlerInit(w, r) {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	gids, msg := groupIdsFromRequest(r)
-	if len(msg) > 0 {
-		x.SetStatus(w, x.ErrorInvalidRequest, msg)
-		return
-	}
-	nid, msg := nodeIdFromRequest(r)
-	if len(msg) > 0 {
-		x.SetStatus(w, x.ErrorInvalidRequest, msg)
-		return
-	}
-	if err := worker.StopServingGroups(ctx, nid, gids); err != nil {
-		x.SetStatus(w, err.Error(), "RemoveGroup failed.")
-	} else {
-		x.SetStatus(w, x.Success, fmt.Sprintf("Groups %d belonging to node %d removed",
-			gids, nid))
-	}
-}
-
-func addGroupsHandler(w http.ResponseWriter, r *http.Request) {
-	if !handlerInit(w, r) {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	gids, msg := groupIdsFromRequest(r)
-	if len(msg) > 0 {
-		x.SetStatus(w, x.ErrorInvalidRequest, msg)
-		return
-	}
-	nid, msg := nodeIdFromRequest(r)
-	if len(msg) > 0 {
-		x.SetStatus(w, x.ErrorInvalidRequest, msg)
-		return
-	}
-	if err := worker.StartServingGroups(ctx, nid, gids); err != nil {
-		x.SetStatus(w, err.Error(), "AddServer failed.")
-	} else {
-		x.SetStatus(w, x.Success, fmt.Sprintf("Node %d started serving groups %v",
-			nid, gids))
-	}
-}
-
-func removeServerHandler(w http.ResponseWriter, r *http.Request) {
-	if !handlerInit(w, r) {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	// User can specify group id's in case server crashed before membership sync
-	gids, msg := groupIdsFromRequest(r)
-	if len(msg) > 0 {
-		gids = gids[:0]
-	}
-	nid, msg := nodeIdFromRequest(r)
-	if len(msg) > 0 {
-		x.SetStatus(w, x.ErrorInvalidRequest, msg)
-		return
-	}
-	if err := worker.RemoveServer(ctx, nid, gids); err != nil {
-		x.SetStatus(w, err.Error(), "RemoveServer failed.")
-	} else {
-		x.SetStatus(w, x.Success, fmt.Sprintf("Server %d removed", nid))
-	}
-}
-
-func clearMembershipHandler(w http.ResponseWriter, r *http.Request) {
-	if !handlerInit(w, r) {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	// User can specify group id's in case server crashed before membership sync
-	gids, msg := groupIdsFromRequest(r)
-	if len(msg) > 0 {
-		x.SetStatus(w, x.ErrorInvalidRequest, msg)
-		return
-	}
-	nid, msg := nodeIdFromRequest(r)
-	if len(msg) > 0 {
-		x.SetStatus(w, x.ErrorInvalidRequest, msg)
-		return
-	}
-	if err := worker.ClearMembership(ctx, nid, gids); err != nil {
-		x.SetStatus(w, err.Error(), "Clear Membership failed.")
-	} else {
-		x.SetStatus(w, x.Success,
-			fmt.Sprintf("Server %d removed from membership", nid))
-	}
 }
 
 func shutDownHandler(w http.ResponseWriter, r *http.Request) {
@@ -967,10 +875,7 @@ func setupServer(che chan error) {
 	http.HandleFunc("/debug/store", storeStatsHandler)
 	http.HandleFunc("/admin/shutdown", shutDownHandler)
 	http.HandleFunc("/admin/backup", backupHandler)
-	http.HandleFunc("/admin/removeServer", removeServerHandler)
-	http.HandleFunc("/admin/addGroups", addGroupsHandler)
-	http.HandleFunc("/admin/removeGroups", removeGroupsHandler)
-	http.HandleFunc("/admin/clearMembership", clearMembershipHandler)
+	http.HandleFunc("/admin/manageCluster", clusterHandler)
 
 	// UI related API's.
 	// Share urls have a hex string as the shareId. So if

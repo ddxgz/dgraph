@@ -25,6 +25,16 @@ message BackupPayload {
 	Status status = 3;
 }
 
+message MembershipChange {
+	uint64 id = 1;
+	uint32 group = 2;
+	enum Op {
+		ADD = 0;
+		REMOVE = 1;
+	}
+	Op op = 3;
+}
+
 service Worker {
 	// Connection testing RPC.
 	rpc Echo (Payload)             returns (Payload) {}
@@ -41,8 +51,7 @@ service Worker {
 	// RAFT serving RPCs.
 	rpc RaftMessage (Payload)                     returns (Payload) {}
 	rpc JoinCluster (taskp.RaftContext)            returns (Payload) {}
-	rpc StartGroup(taskp.RaftContext)					returns (Payload) {}
-	rpc StopGroup(taskp.RaftContext)					returns (Payload) {}
 	rpc UpdateMembership (taskp.MembershipUpdate)  returns (taskp.MembershipUpdate) {}
 	rpc Backup (BackupPayload)                    returns (BackupPayload) {}
+	rpc ManageCluster(MembershipChange)					returns (Payload) {}
 }

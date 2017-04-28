@@ -20,11 +20,14 @@ package worker
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
@@ -40,14 +43,20 @@ import (
 )
 
 const (
-	proposalMutation         = 0
-	proposalReindex          = 1
-	proposalMembership       = 2
-	ErrorNodeIDExists        = "Error Node ID already exists in the cluster"
-	ErrorInvalidToNodeId     = "Error Invalid Recipient Node ID"
-	ErrorNodeIDBanned        = "Error Node with given ID has been banned"
-	ErrorStoppedServingGroup = "Node has stopped serving the group"
-	ErrorNoPeer              = "Peer doesn't exist"
+	proposalMutation   = 0
+	proposalReindex    = 1
+	proposalMembership = 2
+	addGroups          = "ADD_GROUPS"
+	removeGroups       = "REMOVE_GROUPS"
+	removeServer       = "REMOVE_SERVER"
+)
+
+var (
+	errorNodeIDExists        = errors.New("Error Node ID already exists in the cluster")
+	errorInvalidToNodeId     = errors.New("Error Invalid Recipient Node ID")
+	errorNodeIDBanned        = errors.New("Error Node with given ID has been removed/banned")
+	errorStoppedServingGroup = errors.New("Node has stopped serving the group")
+	errorNoPeer              = errors.New("Peer doesn't exist")
 )
 
 // peerPool stores the peers per node and the addresses corresponding to them.
@@ -101,6 +110,19 @@ type sendmsg struct {
 	data []byte
 }
 
+type MembershipChanges struct {
+	Id   uint64
+	Gids []uint32
+	Op   string
+}
+
+func (mc *MembershipChanges) Valid() bool {
+	if mc.Op == addGroups || mc.Op == removeGroups {
+		return len(mc.Gids) > 0
+	}
+	return mc.Op == removeServer
+}
+
 type node struct {
 	x.SafeMutex
 
@@ -151,6 +173,7 @@ func (n *node) SetConfState(cs *raftpb.ConfState) {
 	n.Lock()
 	defer n.Unlock()
 	n._confState = cs
+	fmt.Printf("conf %v\n", cs.Nodes)
 }
 
 // ConfState would return the latest ConfState stored in node.
@@ -456,7 +479,10 @@ func (n *node) doSendMessage(to uint64, data []byte) {
 	select {
 	case <-ctx.Done():
 		return
-	case <-ch:
+	case err := <-ch:
+		if grpc.ErrorDesc(err) == errorNodeIDBanned.Error() {
+			groups().removeNode(n.gid, *raftId)
+		}
 		// We don't need to do anything if we receive any error while sending message.
 		// RAFT would automatically retry.
 		return
@@ -487,12 +513,6 @@ func (n *node) processSchemaMutations(e raftpb.Entry, m *taskp.Mutations) error 
 
 func (n *node) processMembership(e raftpb.Entry, mm *taskp.Membership) error {
 	x.AssertTrue(n.gid == 0)
-	if groups().bannedId(mm.Id) {
-		// Ignore sync memberships from node which has been removed
-		return nil
-	}
-	x.Printf("group: %v Addr: %q leader: %v removed: %v\n",
-		mm.GroupId, mm.Addr, mm.Leader, mm.Removed)
 	groups().applyMembershipUpdate(e.Index, mm)
 	return nil
 }
@@ -543,28 +563,37 @@ func (n *node) processApplyCh() {
 
 			if cc.Type == raftpb.ConfChangeRemoveNode {
 				if n.numPeers() == 0 {
-					err = x.Errorf(ErrorNoPeer)
+					err = errorNoPeer
+				} else {
+					cs := n.Raft().ApplyConfChange(cc)
+					n.SetConfState(cs)
+					// The following check ensures that node doesn't remove
+					// itself during replay of logs when we want to add
+					// the node back
+					if cc.NodeID == *raftId {
+						// sync memberships
+						groups().syncMemberships()
+					}
+					if groups().reject(n.gid, cc.NodeID) {
+						groups().removeNode(n.gid, cc.NodeID)
+					}
 				}
-				// Can't remove node here, otherwise on replay of logs
-				// the node would be removed and we won't be able to add
-				// it ever
 			} else if len(cc.Context) > 0 {
 				var rc taskp.RaftContext
 				x.Check(rc.Unmarshal(cc.Context))
 				// check for removed node id
-				if n.hasID(cc.NodeID) {
-					err = x.Errorf(ErrorNodeIDExists)
-				} else if groups().bannedId(rc.Id) {
-					err = x.Errorf(ErrorNodeIDBanned)
+				if groups().reject(rc.Group, rc.Id) {
+					err = errorNodeIDBanned
 				} else {
 					n.Connect(rc.Id, rc.Addr)
+					cs := n.Raft().ApplyConfChange(cc)
+					n.SetConfState(cs)
 				}
-			}
-
-			if err == nil {
+			} else {
 				cs := n.Raft().ApplyConfChange(cc)
 				n.SetConfState(cs)
 			}
+
 			n.props.Done(cc.ID, err)
 			n.applied.Ch <- mark
 			posting.SyncMarkFor(n.gid).Ch <- mark
@@ -776,6 +805,30 @@ func (n *node) Step(ctx context.Context, msg raftpb.Message) error {
 	return n.Raft().Step(ctx, msg)
 }
 
+func (n *node) checkMembership() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check if node is still present even after being removed
+			// in membership configuration
+			if !n.AmLeader() {
+				continue
+			}
+
+			for _, id := range n.raftPeers() {
+				if groups().reject(n.gid, id) {
+					stopGroup(n.ctx, n.gid, id)
+				}
+			}
+		case <-n.done:
+			return
+		}
+	}
+}
+
 func (n *node) snapshotPeriodically() {
 	if n.gid == 0 {
 		// Group zero is dedicated for membership information, whose state we don't persist.
@@ -829,6 +882,9 @@ func (n *node) snapshot(skip uint64) {
 func (n *node) joinPeers() {
 	// Get leader information for MY group.
 	pid, paddr := groups().Leader(n.gid)
+	if pid == *raftId {
+		return
+	}
 	n.Connect(pid, paddr)
 	fmt.Printf("joinPeers connected with: %q with peer id: %d\n", paddr, pid)
 
@@ -861,6 +917,15 @@ func (n *node) hasID(nid uint64) bool {
 		}
 	}
 	return false
+}
+
+func (n *node) raftPeers() (peers []uint64) {
+	n.RLock()
+	defer n.RUnlock()
+	for _, id := range n.ConfState().Nodes {
+		peers = append(peers, id)
+	}
+	return
 }
 
 func (n *node) numPeers() int {
@@ -947,6 +1012,7 @@ func (n *node) InitAndStartNode(wal *raftwal.Wal) {
 	// state information, which isn't persisted.
 	go n.snapshotPeriodically()
 	go n.batchAndSendMessages()
+	go n.checkMembership()
 }
 
 func (n *node) AmLeader() bool {
@@ -962,10 +1028,11 @@ func (w *grpcWorker) applyMessage(ctx context.Context, msg raftpb.Message) error
 	x.Check(rc.Unmarshal(msg.Context))
 	node := groups().Node(rc.Group)
 	if node == nil {
-		return x.Errorf(ErrorStoppedServingGroup)
+		return errorStoppedServingGroup
 	}
-	if groups().bannedId(msg.From) {
-		return x.Errorf(ErrorNodeIDBanned)
+	// Don't reject messages until the node is not removed
+	if groups().reject(rc.Group, msg.From) && !node.hasID(msg.From) {
+		return errorNodeIDBanned
 	}
 	node.Connect(msg.From, rc.Addr)
 
@@ -1000,7 +1067,7 @@ func (w *grpcWorker) RaftMessage(ctx context.Context, query *workerp.Payload) (*
 			x.Check(err)
 		}
 		if msg.To != *raftId {
-			return &workerp.Payload{}, x.Errorf(ErrorInvalidToNodeId)
+			return &workerp.Payload{}, errorInvalidToNodeId
 		}
 
 		if msg.Type != raftpb.MsgHeartbeat && msg.Type != raftpb.MsgHeartbeatResp {
@@ -1015,80 +1082,59 @@ func (w *grpcWorker) RaftMessage(ctx context.Context, query *workerp.Payload) (*
 	return &workerp.Payload{}, nil
 }
 
-func StartGroup(gid uint32) error {
-	if groups().ServesGroup(gid) {
-		return nil
+func startGroup(gid uint32) error {
+	if !groups().ServesGroup(gid) {
+		node := groups().newNode(uint32(gid), *raftId, *myAddr)
+		err := schema.LoadFromDb(uint32(gid))
+		x.Checkf(err, "Schema load for group %d failed", gid)
+		// Reset watermark
+		posting.SyncMarkFor(gid).SetDoneUntil(0)
+		node.InitAndStartNode(gr.wal)
 	}
-	node := groups().newNode(uint32(gid), *raftId, *myAddr)
-	err := schema.LoadFromDb(uint32(gid))
-	x.Checkf(err, "Schema load for group %d failed", gid)
-	// Reset watermark
-	posting.SyncMarkFor(gid).SetDoneUntil(0)
-	node.InitAndStartNode(gr.wal)
 	_, has := groups().Peer(gid, *raftId)
-	if has && groups().removedNode(gid) {
-		node.joinPeers()
+	if has {
+		groups().Node(gid).joinPeers()
 	}
 	return nil
 }
 
-func (w *grpcWorker) StartGroup(ctx context.Context, rc *taskp.RaftContext) (*workerp.Payload, error) {
-	if ctx.Err() != nil {
-		return &workerp.Payload{}, ctx.Err()
-	}
-	x.AssertTrue(rc.Id == *raftId)
-
-	c := make(chan error, 1)
-	go func() { c <- StartGroup(rc.Group) }()
-
-	select {
-	case <-ctx.Done():
-		return &workerp.Payload{}, ctx.Err()
-	case err := <-c:
-		return &workerp.Payload{}, err
-	}
-}
-
-func StopGroup(ctx context.Context, gid uint32, nodeId uint64) error {
+func stopGroup(ctx context.Context, gid uint32, nodeId uint64) error {
 	node := groups().Node(gid)
 	if node == nil {
 		return nil
 	}
-
+	if node.numPeers() == 0 {
+		// For single node group just stop them
+		groups().removeNode(gid, nodeId)
+		return nil
+	}
 	if err := node.RemoveFromCluster(ctx, nodeId); err != nil {
 		return err
 	}
-	groups().removeNode(gid, nodeId)
-	lastIndex, err := node.store.LastIndex()
-	if err != nil {
-		return err
-	}
-	// wait for pending goroutines
-	if err = node.syncAllMarks(ctx, lastIndex); err != nil {
-		return err
-	}
-	node.snapshot(0)
 	return nil
 }
 
-func (w *grpcWorker) StopGroup(ctx context.Context, rc *taskp.RaftContext) (*workerp.Payload, error) {
+func manageCluster(ctx context.Context, mc *workerp.MembershipChange) error {
+	switch mc.Op {
+	case workerp.MembershipChange_ADD:
+		x.AssertTrue(mc.Id == *raftId)
+		return startGroup(mc.Group)
+	case workerp.MembershipChange_REMOVE:
+		return stopGroup(ctx, mc.Group, mc.Id)
+	default:
+		x.Fatalf("Unknown membership change Op")
+	}
+	x.Fatalf("Shouldn't reach here")
+	return nil
+}
+
+func (w *grpcWorker) ManageCluster(ctx context.Context, mc *workerp.MembershipChange) (*workerp.Payload, error) {
 	if ctx.Err() != nil {
 		return &workerp.Payload{}, ctx.Err()
 	}
 
-	if !groups().ServesGroup(rc.Group) {
-		return &workerp.Payload{}, nil
-	}
-
-	c := make(chan error, 1)
-	go func() { c <- StopGroup(ctx, rc.Group, rc.Id) }()
-
-	select {
-	case <-ctx.Done():
-		return &workerp.Payload{}, ctx.Err()
-	case err := <-c:
-		return &workerp.Payload{}, err
-	}
+	err := manageCluster(ctx, mc)
+	return &workerp.Payload{}, err
 }
 
 func (w *grpcWorker) JoinCluster(ctx context.Context, rc *taskp.RaftContext) (*workerp.Payload, error) {
@@ -1096,9 +1142,9 @@ func (w *grpcWorker) JoinCluster(ctx context.Context, rc *taskp.RaftContext) (*w
 		return &workerp.Payload{}, ctx.Err()
 	}
 
-	// Best effor reject
-	if _, found := groups().Server(rc.Id, rc.Group); found || rc.Id == *raftId {
-		return &workerp.Payload{}, x.Errorf(ErrorNodeIDExists)
+	s, found := groups().Server(rc.Id, rc.Group)
+	if rc.Id == *raftId || (s.Addr == rc.Addr && found) {
+		return &workerp.Payload{}, errorNodeIDExists
 	}
 
 	node := groups().Node(rc.Group)
@@ -1118,144 +1164,100 @@ func (w *grpcWorker) JoinCluster(ctx context.Context, rc *taskp.RaftContext) (*w
 	}
 }
 
-func StartServingGroup(ctx context.Context, nodeId uint64, gid uint32) error {
-	if nodeId == *raftId {
-		return StartGroup(gid)
+func canServeLocally(gid uint32, nodeId uint64, op string) bool {
+	switch op {
+	case addGroups:
+		return nodeId == *raftId
+	default:
+		return groups().ServesGroup(gid)
 	}
-
-	paddr := groups().address(nodeId)
-	if len(paddr) == 0 {
-		return x.Errorf("Node with id %d not found", nodeId)
-	}
-	pools().connect(paddr)
-	fmt.Printf("StartServingGroup connected with: %q with node id: %d\n", paddr, nodeId)
-
-	pool := pools().get(paddr)
-	x.AssertTruef(pool != nil, "Unable to get pool for addr: %q for node: %d", paddr, nodeId)
-
-	conn, err := pool.Get()
-	x.Check(err)
-	defer pool.Put(conn)
-
-	c := workerp.NewWorkerClient(conn)
-	x.Printf("Calling StartServingGroup")
-	_, err = c.StartGroup(ctx, &taskp.RaftContext{
-		Id:    nodeId,
-		Group: gid,
-	})
-	return err
 }
 
-func StartServingGroups(ctx context.Context, nodeId uint64, gids []uint32) error {
-	for _, gid := range gids {
-		if err := StartServingGroup(ctx, nodeId, gid); err != nil {
-			return err
-		}
+func toMembershipChange(gid uint32, nodeId uint64, op string) *workerp.MembershipChange {
+	mc := &workerp.MembershipChange{Id: nodeId, Group: gid}
+	if op == addGroups {
+		mc.Op = workerp.MembershipChange_ADD
+	} else if op == removeGroups || op == removeServer {
+		mc.Op = workerp.MembershipChange_REMOVE
+	} else {
+		x.Fatalf("Unknown membership change")
 	}
-	return nil
+	return mc
 }
 
-func StopServingGroup(ctx context.Context, nodeId uint64, gid uint32) error {
-	if nodeId == *raftId {
-		if err := StopGroup(ctx, gid, nodeId); err != nil {
+func manageClusterOverNetwork(ctx context.Context, gid uint32, nodeId uint64, op string) error {
+	mc := toMembershipChange(gid, nodeId, op)
+	if canServeLocally(gid, nodeId, op) {
+		if err := manageCluster(ctx, mc); err != nil {
 			return err
 		}
-		groups().syncRemovedId(gid, nodeId)
 		return nil
 	}
 
-	paddr := groups().address(nodeId)
-	if len(paddr) == 0 {
-		return x.Errorf("Node with id %d not found", nodeId)
+	var paddr string
+	var pid uint64
+	if op == addGroups {
+		paddr = groups().address(nodeId)
+		if len(paddr) == 0 {
+			return x.Errorf("Node with id %d not found", nodeId)
+		}
+		pid = nodeId
+	} else {
+		pid, paddr = groups().Leader(gid)
+		if len(paddr) == 0 {
+			return x.Errorf("Leader not found for group %d", gid)
+		}
 	}
+
 	pools().connect(paddr)
-	fmt.Printf("StopServingGroup connected with: %q with node id: %d\n", paddr, nodeId)
+	fmt.Printf("Manage Cluster connected with: %q with node id: %d\n", paddr, pid)
 
 	pool := pools().get(paddr)
-	x.AssertTruef(pool != nil, "Unable to get pool for addr: %q for peer: %d", paddr, nodeId)
+	x.AssertTruef(pool != nil, "Unable to get pool for addr: %q for peer: %d", paddr, pid)
 
 	conn, err := pool.Get()
 	x.Check(err)
 	defer pool.Put(conn)
 
 	c := workerp.NewWorkerClient(conn)
-	x.Printf("Calling StopServingGroup")
-	_, err = c.StopGroup(ctx, &taskp.RaftContext{
-		Id:    nodeId,
-		Group: gid,
-	})
+	x.Printf("Calling Manage Cluster")
+	_, err = c.ManageCluster(ctx, mc)
 	if err != nil {
 		return err
 	}
-	return groups().syncRemovedId(gid, nodeId)
-}
-
-func StopServingGroups(ctx context.Context, nodeId uint64, gids []uint32) error {
-	for _, gid := range gids {
-		if err := StopServingGroup(ctx, nodeId, gid); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
-func RemoveGroup(ctx context.Context, nodeId uint64, gid uint32) error {
-	if nodeId == *raftId || groups().ServesGroup(gid) {
-		if err := StopGroup(ctx, gid, nodeId); err != nil {
+func ManageClusterOverNetwork(mc MembershipChanges) error {
+	if mc.Op == removeServer {
+		if len(mc.Gids) == 0 {
+			mc.Gids = groups().groupsServed(mc.Id)
+		}
+		groups().syncBannedId(mc.Id)
+	}
+
+	addr := groups().address(mc.Id)
+	for _, gid := range mc.Gids {
+		if mc.Op == addGroups {
+			if len(addr) == 0 {
+				return x.Errorf(
+					"Node with id %d not found, please retry the request on node %d",
+					mc.Id, mc.Id)
+			}
+			if _, found := groups().Server(mc.Id, gid); found {
+				return x.Errorf("Node %d is already serving group %d", mc.Id, gid)
+			}
+			groups().syncClearRemovedId(gid, mc.Id)
+		} else if mc.Op == removeGroups {
+			if _, found := groups().Server(mc.Id, gid); !found {
+				return x.Errorf("node %d not serving group %d", mc.Id, gid)
+			}
+			groups().syncRemovedId(gid, mc.Id, addr)
+		}
+
+		if err := manageClusterOverNetwork(context.Background(), gid, mc.Id, mc.Op); err != nil {
 			return err
 		}
-		groups().syncRemovedId(gid, nodeId)
-		return nil
-	}
-
-	// Get leader information for MY group.
-	// The server might be down
-	pid, paddr := groups().Leader(gid)
-	if len(paddr) == 0 {
-		return x.Errorf("Leader not found for group %d", gid)
-	}
-	pools().connect(paddr)
-	fmt.Printf("removeGroup connected with: %q with peer id: %d\n", paddr, pid)
-
-	pool := pools().get(paddr)
-	x.AssertTruef(pool != nil, "Unable to get pool for addr: %q for peer: %d", paddr, nodeId)
-
-	conn, err := pool.Get()
-	x.Check(err)
-	defer pool.Put(conn)
-
-	c := workerp.NewWorkerClient(conn)
-	x.Printf("Calling StopServingGroup")
-	_, err = c.StopGroup(ctx, &taskp.RaftContext{
-		Id:    nodeId,
-		Group: gid,
-	})
-	if err != nil {
-		return err
-	}
-	return groups().syncRemovedId(gid, nodeId)
-}
-
-func RemoveServer(ctx context.Context, nodeId uint64, gids []uint32) error {
-	if len(gids) == 0 {
-		gids = groups().groupsServed(nodeId)
-	}
-	if len(gids) == 0 {
-		groups().syncBannedId(nodeId)
-		return nil
-	}
-	for _, gid := range gids {
-		if err := RemoveGroup(ctx, nodeId, gid); err != nil {
-			return err
-		}
-	}
-	groups().syncBannedId(nodeId)
-	return nil
-}
-
-func ClearMembership(ctx context.Context, nodeId uint64, gids []uint32) error {
-	for _, gid := range gids {
-		groups().syncRemovedId(gid, nodeId)
 	}
 	return nil
 }
