@@ -1,6 +1,11 @@
 language: go
+
+os:
+  - osx
+
 go:
 - 1.8
+
 dist: trusty
 sudo: required
 notifications:
@@ -36,6 +41,6 @@ before_script:
 - go get github.com/mattn/goveralls
 script:
 - bash contrib/cover.sh $HOME/build coverage.out
-- bash contrib/load-test.sh $HOME/build
+  # - bash contrib/load-test.sh $HOME/build
 - goveralls -service=travis-ci -coverprofile=coverage.out || true
 - contrib/tlstest/run.sh

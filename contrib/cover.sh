@@ -21,6 +21,7 @@ ROCKSDBDIR=$BUILD/rocksdb-5.1.4
 export CGO_CPPFLAGS="-I${ROCKSDBDIR}/include"
 export CGO_LDFLAGS="-L${ROCKSDBDIR}"
 export LD_LIBRARY_PATH="${ROCKSDBDIR}:${LD_LIBRARY_PATH}"
+export C_INCLUDE_PATH=$C_INCLUDE_PATH:/usr/local/include
 
 set -e
 
