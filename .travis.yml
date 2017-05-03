@@ -12,7 +12,6 @@ matrix:
       env: CC=clang CXX=clang++;
 
 install:
-- bash contrib/install/osx-deps.sh
 - bash contrib/build-rocksdb.sh $HOME/build
 
 dist: trusty
