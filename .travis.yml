@@ -2,12 +2,14 @@ language: go
 
 matrix:
   include:
-    - os: linux
-      compiler: clang-3.9
-      go: 1.8
+    #    - os: linux
+    #      compiler: clang-3.9
+    #      go: 1.8
+    #      env: CC=clang-3.9 CXX=clang++-3.9;
     - os: osx
       compiler: clang
       go: 1.8
+      env: CC=clang CXX=clang++;
 
 install:
 - bash contrib/install/osx-deps.sh
@@ -36,8 +38,6 @@ addons:
   hosts:
     - server1.dgraph.io
     - server2.dgraph.io
-env:
-- CC=clang-3.8 CXX=clang++-3.8
 cache:
   apt: true
   directories:
