@@ -1,7 +1,4 @@
 language: go
-os:
-  - linux
-
 go:
 - 1.8
 
