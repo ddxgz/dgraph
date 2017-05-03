@@ -1,13 +1,11 @@
-language: go
-go:
-- 1.8
-
 matrix:
   include:
     - os: linux
       compiler: clang-3.9
+      go: 1.8
     - os: osx
       compiler: clang
+      go: 1.8
 
 install:
 - if [[ "${TRAVIS_OS_NAME}" == "osx" ]]; then
