@@ -1,9 +1,9 @@
 #!/bin/bash
 
 if [[ "${TRAVIS_OS_NAME}" == "osx" ]]; then
-   brew install snappy lz4;
-   # brew install rocksdb;
-   # exit 0
+   brew install gcc48 --use-llvm;
+   brew install rocksdb;
+   exit 0
  fi
 
 export ROCKSDBVER="5.1.4"
