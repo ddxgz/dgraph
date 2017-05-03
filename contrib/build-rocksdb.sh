@@ -1,10 +1,10 @@
 #!/bin/bash
 
 if [[ "${TRAVIS_OS_NAME}" == "osx" ]]; then
-   brew install gcc48 --use-llvm;
-   brew install rocksdb;
-   exit 0
- fi
+  brew install gcc48 --use-llvm;
+  brew install rocksdb;
+  exit 0
+fi
 
 export ROCKSDBVER="5.1.4"
 ROCKSDBURL="https://github.com/facebook/rocksdb/archive/v${ROCKSDBVER}.tar.gz"
