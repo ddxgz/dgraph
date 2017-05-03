@@ -1,10 +1,25 @@
 language: go
-
 os:
-  - osx
+  - linux
 
 go:
 - 1.8
+
+matrix:
+  include:
+    - os: linux
+      compiler: clang-3.9
+    - os: osx
+      compiler: clang
+
+install:
+  - if [[ "${TRAVIS_OS_NAME}" == "osx" ]]; then
+      brew tap homebrew/versions
+      # To install gcc 4.7.
+      brew install gcc47 --use-llvm
+      # Install dependencies
+      $ brew install snappy lz4
+    fi
 
 dist: trusty
 sudo: required
