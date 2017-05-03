@@ -13,13 +13,12 @@ matrix:
       compiler: clang
 
 install:
-  - if [[ "${TRAVIS_OS_NAME}" == "osx" ]]; then
-      brew tap homebrew/versions
-      # To install gcc 4.7.
-      brew install gcc47 --use-llvm
-      # Install dependencies
-      $ brew install snappy lz4
-    fi
+- if [[ "${TRAVIS_OS_NAME}" == "osx" ]]; then
+    brew tap homebrew/versions
+    brew install gcc47 --use-llvm
+    brew install snappy lz4
+  fi
+- bash contrib/build-rocksdb.sh $HOME/build
 
 dist: trusty
 sudo: required
@@ -50,8 +49,6 @@ cache:
   apt: true
   directories:
   - "$HOME/build"
-install:
-- bash contrib/build-rocksdb.sh $HOME/build
 before_script:
 - go get github.com/mattn/goveralls
 script:
