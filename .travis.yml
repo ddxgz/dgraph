@@ -26,9 +26,9 @@ addons:
   apt:
     sources:
     - ubuntu-toolchain-r-test
-    - llvm-toolchain-precise-3.8
+    - llvm-toolchain-precise-3.9
     packages:
-    - clang-3.8
+    - clang-3.9
     - libbz2-dev
     - libsnappy-dev
     - zlib1g-dev
