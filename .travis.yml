@@ -10,11 +10,7 @@ matrix:
       go: 1.8
 
 install:
-- if [[ "${TRAVIS_OS_NAME}" == "osx" ]]; then
-    brew tap homebrew/versions
-    brew install gcc47 --use-llvm
-    brew install snappy lz4
-  fi
+- bash contrib/install/osx-deps.sh
 - bash contrib/build-rocksdb.sh $HOME/build
 
 dist: trusty
